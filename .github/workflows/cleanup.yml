@@ -1,0 +1,122 @@
+name: "🗑️ Auto Cleanup Old Videos"
+
+on:
+  schedule:
+    # اجرا هر 5 دقیقه
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    name: "🧹 Delete folders older than 5 minutes"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: "⚙️ Configure Git"
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: "🗑️ Delete old folders (older than 5 minutes)"
+        run: |
+          #!/bin/bash
+          set -e
+          
+          CLEANUP_COUNT=0
+          CURRENT_TIME=$(date +%s)
+          FIVE_MINUTES_AGO=$((CURRENT_TIME - 300))  # 5 دقیقه قبل
+          
+          echo "🕐 Current time: $(date)"
+          echo "🔍 Looking for folders older than 5 minutes..."
+          
+          if [ ! -d "videos" ]; then
+            echo "📁 No 'videos' folder found."
+            exit 0
+          fi
+          
+          # لیست تمام فولدرهای داخل videos
+          for FOLDER in videos/*/ ; do
+            [ -d "$FOLDER" ] || continue
+            
+            FOLDER_NAME=$(basename "$FOLDER")
+            echo "📂 Checking: $FOLDER_NAME"
+            
+            # روش 1: بررسی تاریخ commit آخرین بار برای این فولدر
+            LAST_COMMIT_TIME=$(git log -1 --format=%ct -- "videos/$FOLDER_NAME" 2>/dev/null || echo "0")
+            
+            # روش 2: بررسی تاریخ آخرین تغییر فایل‌های داخل فولدر با git
+            LAST_FILE_CHANGE=$(git log -1 --format=%ct -- "videos/$FOLDER_NAME/*" 2>/dev/null || echo "0")
+            
+            # روش 3: بررسی تاریخ ایجاد فولدر از طریق ls (fallback)
+            if [ "$LAST_COMMIT_TIME" -eq 0 ] && [ "$LAST_FILE_CHANGE" -eq 0 ]; then
+              # از stat استفاده کن (تاریخ ساخت فولدر در سیستم)
+              if command -v stat &> /dev/null; then
+                if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+                  FOLDER_CREATED=$(stat -c %Y "$FOLDER" 2>/dev/null || echo "0")
+                else
+                  FOLDER_CREATED=$(stat -f %B "$FOLDER" 2>/dev/null || echo "0")
+                fi
+              else
+                FOLDER_CREATED=0
+              fi
+            else
+              FOLDER_CREATED=$(( LAST_COMMIT_TIME > LAST_FILE_CHANGE ? LAST_COMMIT_TIME : LAST_FILE_CHANGE ))
+            fi
+            
+            # اگر هیچ تاریخی پیدا نشد، از زمان حال کم کن
+            if [ "$FOLDER_CREATED" -eq 0 ]; then
+              echo "  ⚠️ Could not determine folder age, keeping it."
+              continue
+            fi
+            
+            FOLDER_AGE=$((CURRENT_TIME - FOLDER_CREATED))
+            FOLDER_AGE_MIN=$((FOLDER_AGE / 60))
+            
+            echo "  📅 Created/Modified: $(date -d @$FOLDER_CREATED 2>/dev/null || date -r $FOLDER_CREATED)"
+            echo "  ⏱️ Age: ${FOLDER_AGE_MIN} minute(s)"
+            
+            if [ "$FOLDER_CREATED" -lt "$FIVE_MINUTES_AGO" ]; then
+              echo "  🗑️ DELETING: $FOLDER_NAME (older than 5 minutes)"
+              rm -rf "$FOLDER"
+              CLEANUP_COUNT=$((CLEANUP_COUNT + 1))
+            else
+              echo "  ✅ Keeping: $FOLDER_NAME (still fresh)"
+            fi
+          done
+          
+          # مرحله 2: پاک کردن فایل‌های orphan (فایل‌هایی که داخل فولدر نیستند)
+          if [ -d "videos" ]; then
+            for FILE in videos/*; do
+              if [ -f "$FILE" ]; then
+                FILE_NAME=$(basename "$FILE")
+                echo "  🗑️ Deleting orphan file: $FILE_NAME"
+                rm -f "$FILE"
+                CLEANUP_COUNT=$((CLEANUP_COUNT + 1))
+              fi
+            done
+          fi
+          
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "  🧹 Cleanup complete!"
+          echo "  📊 Removed: $CLEANUP_COUNT item(s)"
+          echo "════════════════════════════════════════"
+          
+          # اگر چیزی پاک شد، commit کن
+          if [ "$CLEANUP_COUNT" -gt 0 ]; then
+            git add -A videos/ 2>/dev/null || true
+            if ! git diff --cached --quiet; then
+              git commit -m "[auto-cleanup] 🗑️ Removed old videos (older than 5 minutes)" --quiet || true
+              git push origin HEAD:"${{ github.ref_name }}" --quiet || true
+              echo "✅ Changes pushed to repository"
+            fi
+          fi
